@@ -1,8 +1,11 @@
-# maibot-patch
+# MaiBot 一键补丁工具（maibot-patch）
 
-[MaiBot](https://github.com/MaiM-with-u/MaiBot) 一键补丁工具——自包含单文件 Python 脚本，无需安装任何依赖。
+> 针对 [MaiBot](https://github.com/MaiM-with-u/MaiBot) 源码核查后整理的一键补丁——自包含单文件 Python 脚本，附带配套的上游 issue 整理文档。
 
-针对 MaiBot **1.2.4 / 1.2.5** 源码核查后整理的修复集，附带配套的上游 issue 整理文档 [`maibot-issues.md`](maibot-issues.md)（对齐官方 issue 模板字段，可逐字段复制提交）。
+- 适用版本：MaiBot 1.2.4 / 1.2.5（按 tag 逐一验证锚点行）
+- 依赖：无（Python 3 标准库，单文件脚本）
+- 作者：[Elmeir](https://github.com/Elmeir) ｜ License：MIT
+- 配套文档：[`maibot-issues.md`](maibot-issues.md)（对齐官方 issue 模板字段，可逐字段复制提交）
 
 ## 补丁组
 
@@ -33,11 +36,11 @@ python maibot_patch_all.py --revert                 # 从最近备份一键还�
 - **幂等**：已打过的补丁自动跳过，可重复执行
 - **可还原**：`--revert` 从最近备份还原所有文件
 
-## 适用版本
-
-MaiBot 1.2.4 / 1.2.5（按 tag 逐一验证锚点行）。其他版本请先 dry-run 检查 diff 是否匹配。
-
 ## 相关仓库
 
 - 上游：[MaiM-with-u/MaiBot](https://github.com/MaiM-with-u/MaiBot)
-- 配套插件：`maibot-plugin-gif-storyboard`、`maibot-plugin-knowledge-base`
+- 配套插件：`maibot-plugin-doubao-tts`、`maibot-plugin-gif-storyboard`、`maibot-plugin-person-alias`、`maibot-plugin-knowledge-base`
+
+## 许可证
+
+[MIT](LICENSE)
