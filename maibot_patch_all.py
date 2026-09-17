@@ -108,6 +108,26 @@ MaiBot 一键补丁（自包含，无需其它文件）
       插件侧无需任何修改：重载链路 = on_unload → purge 模块 → 重新 import →
       on_load → 组件重注册，runner 已处理 sys.modules 清理。
 
+  [summary] 引用回复导致长期记忆张冠李戴（A 引用 B 说话 → 事实归到 B）
+      现象：A 引用 B 的回复并发言，长期记忆/人物画像里经常被记成「B XXX」——
+      说话人归属错乱。
+      根因（1.2.5 源码核查）：引用回复在纯文本里渲染为行内前缀
+      `[回复了B的消息: B的原话]`（src/chat/message_receive/message.py:441/452），
+      拼进行后为 `[时间] A说：[回复了B的消息: B的原话] A说的XXX`。总结提示词
+      （A_memorix summary_importer.py SUMMARY_PROMPT_TEMPLATE）虽有「引用文本
+      不入事实」「严格绑定发言者」规则，但没有任何一处解释这个前缀的语义，
+      模型看到行内 B 的名字与原话便把内容归到 B 头上。
+      方案：在 SUMMARY_PROMPT_TEMPLATE 的事实筛选规则中补充三条引用归属规则：
+        - 每条消息发言者只认「说：」前面的名字；内容开头的
+          [回复了X的消息: 原话] 是发言者引用的他人原话，不是发言者或 X 的新发言；
+        - 引用场景示例：只有引用者明确复述确认，被引用原话才能记为被引用者的
+          事实，且不得张冠李戴到引用者身上；
+        - 引用者明确转述确认时才可记录，来源为引用者转述。
+      注：渲染格式不动——reply_necessity.py 等处依赖 `[回复了...]` 前缀做正则
+      剥离，改渲染格式牵连面大；只补提示词语义。宿主中期记忆模板
+      prompts/zh-CN/mid_term_memory_summary.prompt 是数据文件，可在 WebUI
+      自行加同类规则（不需补丁）。
+
 安全
 ----
 * 默认 **dry-run**（只打印 diff），加 --apply 才写文件；
@@ -379,6 +399,20 @@ RELOAD_NEW = [
     '        logger.warning("插件源码变更后回退全量重启失败")',
 ]
 
+# ============================================================ [summary] 引用回复归属
+# 注意：引擎按"匹配行缩进 + new 行原文"叠加缩进（_find 按 strip 匹配）。
+# SUMMARY_PROMPT_TEMPLATE 是模块级字符串常量，内容行无缩进（base=空），
+# new 行按原文写入即可。
+SUMMARY_QUOTE_OLD = [
+    "- 相似昵称或多人多线程时，必须严格绑定发言者与事实；不要把 A 的地点、行程、偏好、健康状况合并到 B 身上。",
+]
+SUMMARY_QUOTE_NEW = [
+    "- 相似昵称或多人多线程时，必须严格绑定发言者与事实；不要把 A 的地点、行程、偏好、健康状况合并到 B 身上。",
+    "- 每条消息的发言者只认「说：」前面的名字；消息内容开头的「[回复了X的消息: 原话]」是发言者引用的他人原话，属于引用文本：它既不是发言者本人说的话，也不是 X 的新发言。",
+    "- 引用场景归属示例：「A说：[回复了B的消息: 我明天去北京] 好啊一起」——只能记录 A 回应了同行/计划；除非 A 明确复述确认，否则不要把「B 明天去北京」记为 B 的事实，更不要把被引用内容里的信息张冠李戴到引用者 A 身上。",
+    "- 只有当引用者明确转述并确认被引用内容时（如「B 明天去北京，我也去」），才可把「B 明天去北京」记录为 B 的事实；来源按引用者转述处理，且引用者本人的事实只包括其自己陈述的部分。",
+]
+
 # ============================================================ 补丁清单（按文件分组）
 GROUPS = {
     "2010": {
@@ -459,6 +493,13 @@ GROUPS = {
         # （映射不到已注册插件 / 定向重载失败时回退全量重启）
         os.path.join("src", "plugin_runtime", "integration.py"): [
             {"kind": "replace_lines", "old": RELOAD_OLD, "new": RELOAD_NEW},
+        ],
+    },
+    "summary": {
+        # 引用回复导致长期记忆张冠李戴：总结提示词补充 [回复了X的消息: ...] 前缀的
+        # 语义与归属规则（A 引用 B 说话不再被记成 B 的事实）
+        os.path.join(A, "core", "utils", "summary_importer.py"): [
+            {"kind": "replace_lines", "old": SUMMARY_QUOTE_OLD, "new": SUMMARY_QUOTE_NEW},
         ],
     },
     # 注意：planner 误回复自己消息（is_self_message 无提示词解释）不做成补丁——
@@ -678,7 +719,7 @@ def main() -> int:
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--revert", action="store_true")
     ap.add_argument("--detect", action="store_true", help="只定位并打印后退出")
-    ap.add_argument("--only", choices=["all", "2010", "tools", "order", "trigger", "target", "wait", "reload"], default="all")
+    ap.add_argument("--only", choices=["all", "2010", "tools", "order", "trigger", "target", "wait", "reload", "summary"], default="all")
     ap.add_argument("--no-backup", action="store_true")
     args = ap.parse_args()
 

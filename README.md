@@ -18,6 +18,7 @@
 | `target` | 出现新消息后 planner 重复回复旧消息（"A→回复A→B→又回复A"） | 改写每轮末尾提醒 `PLANNER_FINAL_USER_REMINDER_TEMPLATE`：越靠后越新、优先回应未回复过的最新消息、自己的消息不是他人发言（与 WebUI 自定义提示词文本互补） |
 | `wait` | wait 工具时长无上限：LLM 自选任意秒数，长 wait 造成长时间沉默与空转 | 钳制 `wait_seconds ≤ 60`（工具结果如实报告钳后值，模型可感知）+ 工具描述注明建议区间；连续次数上限已有配置 `max_consecutive_wait_count` |
 | `reload` | file_watcher 源码变更一律**全量重启**所有插件运行时，成本随插件数/数据量线性增长，装得越多重启越慢 | 变更路径映射到受影响插件 ID → 走宿主现成的 `reload_plugins_globally` 定向重载（on_unload → 清模块 → 重 import → on_load）；映射不到（新装插件）或重载失败时回退全量重启。**插件无需任何修改** |
+| `summary` | 引用回复导致长期记忆张冠李戴：A 引用 B 的回复并发言，事实被记成「B XXX」 | 总结提示词（A_memorix `SUMMARY_PROMPT_TEMPLATE`）补充 `[回复了X的消息: 原话]` 前缀语义与归属规则：发言者只认「说：」前的名字，被引用原话仅在引用者明确转述确认时才可入事实 |
 
 ## 用法
 
