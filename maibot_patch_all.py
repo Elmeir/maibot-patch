@@ -35,6 +35,26 @@ MaiBot 一键补丁（自包含，无需其它文件）
       副作用评估：_drop_head_context_messages 从头部裁剪 → 裁掉的是最旧消息，语义更正确；
       学习器/效果追踪按时间序读取，不受影响。
 
+  [D] planner 误回复自己消息 —— 不做成补丁
+      is_self_message="true" 属性在 prompts/*/maisaka_chat*.prompt 中零解释，导致 planner
+      把 bot 自己的回复当他人发言来回应（详见 maibot-issues.md Issue 8）。但提示词是
+      数据文件：WebUI「提示词」页 / data/custom_prompts/ 可直接管理覆盖，不需要补丁；
+      需要添加的文本见 maibot-issues.md Issue 8 补充信息。
+
+  [target] 出现新消息后 planner 重复回复旧消息——末尾提醒缺少回复目标指引
+      现象：A 消息 → bot 回复 A（带引用）→ B 消息到达 → planner 再次回复 A（而非 B
+      或不回复）。reply 工具虽检测"重复目标"并把提醒传给回复器，但不拦截发送；且
+      planner 侧提示词没有任何"对同一条消息只回复一次/优先回应新消息"的约束。
+      根因（1.2.4/1.2.5 源码核查）：planner 请求的新消息与历史混排、无分界；每轮
+      末尾的一次性 user 提醒（PLANNER_FINAL_USER_REMINDER_TEMPLATE，
+      chat_loop_service.py:86）只有一句"输出对{bot_name}发言的分析"，完全没有回复
+      目标指引。
+      方案：改写该常量——末尾提醒显式声明"越靠后越新；重点针对最新的、尚未回复
+      过的用户消息决定动作；更早的历史仅供理解背景，不要回应；自己的消息不是别人
+      的发言"。位置紧邻模型生成点、注意力权重最高，单点常量替换。
+      注：与 [D] 的 WebUI 提示词文本互补不重复（那边讲消息格式语义，这边讲本轮
+      决策对象）；也与 Issue 3 的 [order] 排序修复正交。
+
   [trigger] 回复后紧邻消息的触发被静默丢弃（"A→planner→B→reply→回复A→B 丢失"）
       现象：A 发言触发 planner → planner 处理期间 B 发言 → planner 调 reply → 回复 A →
       B 的消息触发被丢弃，B 滞留 message_cache 不进 Planner（直到下一条消息才可能被
@@ -60,6 +80,33 @@ MaiBot 一键补丁（自包含，无需其它文件）
             重查趋于触发而收敛），冷启动无样本时回退 5 秒。
       幂等性：重查时 pending 消息一旦被消费（_last_processed_index 推进）pending_count=0
       直接返回，不会空转；_defer_message_turn_check 自带单任务取消语义，不会堆积。
+
+  [wait] wait 时长无上限钳制（模型可自选任意等待秒数）
+      现象：wait 工具的 seconds 参数由 LLM 自选，宿主只钳下限 0（wait.py
+      wait_seconds = max(0, wait_seconds)），模型传 300 秒就真等 300 秒——
+      期间新消息不打断等待，造成长时间沉默与空转。
+      方案：wait.py 钳制 wait_seconds ≤ 60（工具结果文本会如实报告钳后的值，
+      模型能感知）；工具描述同步注明上限，引导模型一开始就选合理时长。
+      注：连续 wait 次数上限已有配置（chat.reply_timing.max_consecutive_wait_count），
+      本补丁只管"每次等多久"。
+
+  [reload] file_watcher 源码变更从全量重启改为定向重载
+      现象：插件树里任何一个 .py 变化都会重启全部插件运行时（shutdown 所有
+      Supervisor + 依赖同步 + 冷启动重新 import 全部插件）。重启成本随插件数
+      与加载期数据线性增长，装得越多越慢。
+      根因（1.2.5 源码核查）：_handle_plugin_source_changes
+      （src/plugin_runtime/integration.py）把源码变更一律走 _restart_supervisors
+      全量重启；而宿主本就具备单插件热重载通路（runner 侧 plugin.reload_batch
+      RPC，宿主侧 reload_plugins_globally，supervisor.reload_plugins），仅源码
+      变更路径没有接上。
+      方案：把变更文件路径映射到受影响插件 ID（复用 _match_plugin_id_for_
+      supervisor，跨两个 Supervisor 查找去重）：
+        - 映射不到任何已注册插件（如新装插件目录）→ 保持原全量重启；
+        - 映射得到 → 依赖同步照跑（保证新声明的依赖先装好/被阻止），然后
+          reload_plugins_globally(受影响插件) 定向重载；
+        - 定向重载失败（如全部被依赖流水线阻止）→ 回退全量重启，保底不劣化。
+      插件侧无需任何修改：重载链路 = on_unload → purge 模块 → 重新 import →
+      on_load → 组件重注册，runner 已处理 sys.modules 清理。
 
 安全
 ----
@@ -182,6 +229,10 @@ INGEST_NEW = [
     "    return len(self._runtime._chat_history) - 1",
 ]
 
+# ============================================================ [D] planner 误回复自己消息 —— 不做成补丁
+# 提示词是数据文件：WebUI「提示词」页 / data/custom_prompts/ 可直接管理覆盖，
+# 需要添加的文本见 maibot-issues.md Issue 8 补充信息。
+
 B = os.path.join("src", "maisaka", "builtin_tool")
 A = os.path.join("src", "A_memorix")
 
@@ -255,6 +306,79 @@ TRIGGER_RECHECK_DELAY_NEW = [
     "def should_trigger_by_reply_necessity(",
 ]
 
+# ============================================================ [target] 末尾提醒补回复目标指引
+TARGET_OLD = [
+    "PLANNER_FINAL_USER_REMINDER_TEMPLATE = (",
+    '"你需要输出对{bot_name}发言的分析，视情况输出文本内容的分析，思考是否进行工具调用"',
+    ")",
+]
+TARGET_NEW = [
+    "PLANNER_FINAL_USER_REMINDER_TEMPLATE = (",
+    '    "上下文中越靠后的消息越新。请重点针对最新的、{bot_name} 尚未回复过的用户消息决定下一步动作；"',
+    '    "更早的历史消息仅供理解背景，不要回应它们；{bot_name} 自己发送的消息（is_self_message=\\"true\\"）不是别人的发言。"',
+    '    "之后，你需要输出对{bot_name}发言的分析，视情况输出文本内容的分析，思考是否进行工具调用"',
+    ")",
+]
+
+# ============================================================ [wait] wait 时长上限钳制
+# 注意：引擎按"匹配行缩进 + new 行原文"叠加缩进（_find 按 strip 匹配），
+# new 行不要带绝对缩进，需要层级时只写相对缩进。
+WAIT_SECONDS_OLD = [
+    "wait_seconds = max(0, wait_seconds)",
+]
+WAIT_SECONDS_NEW = [
+    "# 硬上限：模型传入的等待时长最大不超过 60 秒，防止长 wait 造成长时间沉默",
+    "wait_seconds = max(0, min(wait_seconds, 60))",
+]
+WAIT_DESC_OLD = [
+    '"description": "等待秒数。",',
+]
+WAIT_DESC_NEW = [
+    '"description": "等待秒数，建议 30~60，最长不超过 60。",',
+]
+
+# ============================================================ [reload] file_watcher 定向重载
+# 注意：引擎按"匹配行缩进 + new 行原文"叠加缩进（_find 按 strip 匹配），
+# new 行不要带绝对缩进，需要层级时只写相对缩进（首行 0 → 落在函数体 8 空格）。
+RELOAD_OLD = [
+    "dependency_sync_state = await self._sync_plugin_dependencies(plugin_dirs)",
+    'restart_reason = "file_watcher"',
+    "if dependency_sync_state.environment_changed:",
+    'restart_reason = "file_watcher_dependency_install"',
+    "elif dependency_sync_state.blocked_changed_plugin_ids:",
+    'restart_reason = "file_watcher_blocklist_changed"',
+    "",
+    "restarted = await self._restart_supervisors(restart_reason)",
+    "if not restarted:",
+    'logger.warning(f"插件源码变更后重启 Supervisor 失败: {restart_reason}")',
+]
+RELOAD_NEW = [
+    "affected_plugin_ids: list[str] = []",
+    "for supervisor in self.supervisors:",
+    "    for change_path in relevant_source_changes:",
+    "        matched_plugin_id = self._match_plugin_id_for_supervisor(supervisor, change_path)",
+    "        if matched_plugin_id and matched_plugin_id not in affected_plugin_ids:",
+    "            affected_plugin_ids.append(matched_plugin_id)",
+    "dependency_sync_state = await self._sync_plugin_dependencies(plugin_dirs)",
+    "if not affected_plugin_ids:",
+    '    restart_reason = "file_watcher"',
+    "    if dependency_sync_state.environment_changed:",
+    '        restart_reason = "file_watcher_dependency_install"',
+    "    elif dependency_sync_state.blocked_changed_plugin_ids:",
+    '        restart_reason = "file_watcher_blocklist_changed"',
+    "    restarted = await self._restart_supervisors(restart_reason)",
+    "    if not restarted:",
+    '        logger.warning(f"插件源码变更后重启 Supervisor 失败: {restart_reason}")',
+    "    return",
+    "",
+    'reloaded = await self.reload_plugins_globally(affected_plugin_ids, reason="file_watcher")',
+    "if not reloaded:",
+    '    logger.warning(f"插件源码变更后定向重载失败，回退全量重启: {affected_plugin_ids}")',
+    '    restarted = await self._restart_supervisors("file_watcher_fallback")',
+    "    if not restarted:",
+    '        logger.warning("插件源码变更后回退全量重启失败")',
+]
+
 # ============================================================ 补丁清单（按文件分组）
 GROUPS = {
     "2010": {
@@ -317,6 +441,29 @@ GROUPS = {
             {"kind": "replace_lines", "old": TRIGGER_RECHECK_DELAY_ANCHOR, "new": TRIGGER_RECHECK_DELAY_NEW},
         ],
     },
+    "target": {
+        # 出现新消息后 planner 重复回复旧消息：末尾提醒补回复目标指引
+        os.path.join(TS, "chat_loop_service.py"): [
+            {"kind": "replace_lines", "old": TARGET_OLD, "new": TARGET_NEW},
+        ],
+    },
+    "wait": {
+        # wait 时长无上限：模型自选任意秒数 → 钳制 ≤60 秒 + 描述注明上限
+        os.path.join(M, "builtin_tool", "wait.py"): [
+            {"kind": "replace_lines", "old": WAIT_SECONDS_OLD, "new": WAIT_SECONDS_NEW},
+            {"kind": "replace_lines", "old": WAIT_DESC_OLD, "new": WAIT_DESC_NEW},
+        ],
+    },
+    "reload": {
+        # file_watcher 源码变更：全量重启 Supervisor → 按变更路径定向重载受影响插件
+        # （映射不到已注册插件 / 定向重载失败时回退全量重启）
+        os.path.join("src", "plugin_runtime", "integration.py"): [
+            {"kind": "replace_lines", "old": RELOAD_OLD, "new": RELOAD_NEW},
+        ],
+    },
+    # 注意：planner 误回复自己消息（is_self_message 无提示词解释）不做成补丁——
+    # 提示词是数据文件，WebUI「提示词」页 / data/custom_prompts/ 可直接管理覆盖，
+    # 需要添加的文本见 maibot-issues.md Issue 8 补充信息。
 }
 
 WINDOW = 6
@@ -510,27 +657,28 @@ def process(repo, rel, ops, apply_, revert_, no_backup):
         shutil.copy2(path, bak)
     with open(path, "w", encoding="utf-8") as f:
         f.writelines(new_lines)
-    # 语法自检
-    try:
-        py_compile.compile(path, cfile=os.path.join(tempfile.gettempdir(), "_synccheck.pyc"), doraise=True)
-    except Exception as exc:
-        if bak:
-            shutil.copy2(bak, path)
-            print(MARK, f"[语法错误→已回滚] {exc}")
-        else:
-            print(MARK, f"[语法错误] {exc}（未备份，未回滚）")
-        return "fail"
+    # 语法自检（仅 Python 源码；.prompt 等数据文件跳过）
+    if path.endswith(".py"):
+        try:
+            py_compile.compile(path, cfile=os.path.join(tempfile.gettempdir(), "_synccheck.pyc"), doraise=True)
+        except Exception as exc:
+            if bak:
+                shutil.copy2(bak, path)
+                print(MARK, f"[语法错误→已回滚] {exc}")
+            else:
+                print(MARK, f"[语法错误] {exc}（未备份，未回滚）")
+            return "fail"
     print(MARK, f"[已写入]{' 备份=' + os.path.basename(bak) if bak else ''}")
     return "ok"
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="MaiBot 一键补丁（#2010 + 工具描述 + 聊天记录时序 + 触发门兜底）")
+    ap = argparse.ArgumentParser(description="MaiBot 一键补丁（#2010 + 工具描述 + 聊天记录时序 + 触发门兜底 + 回复目标指引）")
     ap.add_argument("--repo", default="", help="MaiBot 根目录；留空自动定位")
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--revert", action="store_true")
     ap.add_argument("--detect", action="store_true", help="只定位并打印后退出")
-    ap.add_argument("--only", choices=["all", "2010", "tools", "order", "trigger"], default="all")
+    ap.add_argument("--only", choices=["all", "2010", "tools", "order", "trigger", "target", "wait", "reload"], default="all")
     ap.add_argument("--no-backup", action="store_true")
     args = ap.parse_args()
 

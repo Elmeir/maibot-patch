@@ -193,6 +193,66 @@ gif-storyboard 实测：被迫改用插件内部登记表（按"组件索引 + h
 
 ---
 
+## Issue 8（中）｜模板：Bug｜标题：Planner 会把 bot 自己的引用回复当作他人消息——`is_self_message` 属性无提示词解释
+
+**组件**：`prompts/*/maisaka_chat*.prompt`、`src/maisaka/context/planner_messages.py`
+
+### 问题描述
+
+bot 引用回复消息 A 后，下一轮 planner 把 bot 自己的这条回复当作其他用户的发言，reply 目标选中它，产生"回复了自己的回复"。
+
+### 如何重现此问题？
+
+1. bot 对某条消息调用 reply（`set_quote=true`，带引用）；
+2. 该回复进入 planner 上下文：`<message msg_id="send_api_xxx" ... user="{bot_name}" is_self_message="true">`（引用组件在进历史时被剔除，属性由 planner_messages.py:71 打上）；
+3. 该消息内容延续话题 A 且位于上下文末尾时，planner 把它当参与者发言，reply 的 `msg_id` 选中它。
+
+### 可能造成问题的原因
+
+`is_self_message="true"` 属性在提示词中**零解释**：`prompts/*/maisaka_chat*.prompt` 全文没有说明 `<message>` 标签任何属性的含义，且明确定位"{bot_name} 也是一位参与的用户"——模型把 `user="{bot_name}"` 的消息当参与者发言回应是"合理"行为。replyer 侧反而有显式防护（maisaka_generator_base.py:185 "不要把你自己的发言当成别人的发言"），说明该场景已知，但 planner 选择目标的环节没有引导；reply 工具描述也未声明目标不应为自己的消息。
+
+已排除：适配器回声（Napcat 适配器 `ignore_self_message` 过滤正确：`sender_user_id == self_id` 即丢弃，`message_sent` 事件不被路由）。
+
+### 补充信息
+
+提示词是数据文件，可通过 WebUI「提示词」页（或 `data/custom_prompts/<locale>/` 覆盖文件）直接管理，**无需改源码**。在自定义版 `maisaka_chat.prompt`（以及启用 focus 模式时的 `maisaka_chat_focus.prompt`）中、"关于参与用户"段落之后添加：
+
+```
+聊天记录中每条消息以 <message ...> 标签开头：user 是发送者名字，is_self_message="true" 表示这条消息是 {bot_name} 自己发送的。
+{bot_name} 自己发送的消息不是其他用户的发言：不要把它当成别人说的话来回应，也不要仅仅因为它出现在上下文末尾就回复它。
+只有当你想主动补充说明 {bot_name} 刚才的发言时，才允许把这类消息作为 reply 的目标。
+```
+
+注意：`data/custom_prompts/` 的自定义版本优先级高于内置模板——保存过自定义版后，升级内置模板的修改不会自动跟进，需自行维护。
+
+---
+
+## Issue 9（中）｜模板：Bug｜标题：出现新消息后 Planner 可能重复回复旧消息——每轮末尾提醒缺少回复目标指引
+
+**组件**：`src/maisaka/chat_loop_service.py`（`PLANNER_FINAL_USER_REMINDER_TEMPLATE`）
+
+### 问题描述
+
+A 消息 → bot 回复 A（带引用）→ B 消息到达 → planner 再次回复 A（而非 B 或不回复），表现为重复回复旧消息。
+
+### 如何重现此问题？
+
+1. bot 回复消息 A；
+2. 新消息 B 到达并触发新一轮 planner；
+3. planner 上下文为 `[...A、bot回复A（is_self_message="true"）、B...]`，但 planner 选择把 A 作为 reply 目标再次回复。
+
+### 可能造成问题的原因
+
+1. planner 请求里新消息与历史**混排无分界**，模型需自行判断该回应哪些消息；
+2. 每轮末尾的一次性 user 提醒（`PLANNER_FINAL_USER_REMINDER_TEMPLATE`，chat_loop_service.py:86）只有"输出对{bot_name}发言的分析"，**没有任何回复目标指引**（该常量为 Python 源码常量，WebUI 不可改）；
+3. reply 工具对"重复目标"仅向回复器传提醒（定性为"补充说明"），不拦截、也不让 planner 重新决策。
+
+### 补充信息
+
+建议修复：末尾提醒显式声明回复目标指引——"越靠后越新；重点针对最新的、{bot_name} 尚未回复过的用户消息决定动作；更早的历史仅供理解背景，不要回应；自己的消息不是别人的发言"。临时补丁：`maibot_patch_all.py` 组 `[target]`（单点常量替换，1.2.4/1.2.5 验证通过）。与 Issue 8 的提示词文本互补（那边讲消息格式语义，这边讲本轮决策对象）。
+
+---
+
 ## 附：已确认无需上报的行为（避免误报）
 
 | 行为 | 结论 |
