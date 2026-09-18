@@ -107,6 +107,15 @@ MaiBot 一键补丁（自包含，无需其它文件）
         - 定向重载失败（如全部被依赖流水线阻止）→ 回退全量重启，保底不劣化。
       插件侧无需任何修改：重载链路 = on_unload → purge 模块 → 重新 import →
       on_load → 组件重注册，runner 已处理 sys.modules 清理。
+      v2 增强（2026-09-19，部署实测暴露的中间态问题）：
+        - 现象：整目录替换/大目录复制进行中时，600ms 防抖窗口仍可能提前触发，
+          读到空 _manifest.json / 半截 .py → 定向重载失败 → 回退全量重启
+          （日志链：Manifest 校验失败 → 插件目录已不存在(已恢复旧版本) →
+          回退全量重启）；
+        - 增强一：插件源码 watcher 防抖 600 → 1500ms（中途批次更易合并到稳定态）；
+        - 增强二：变更批次就绪预检——_manifest.json 须可解析、.py 须可编译；
+          不就绪则延迟 1.5s 复查一次，仍不就绪跳过本批（等后续文件事件），
+          不让半截文件进入重载/全量路径（跳过时打印 warning）。
 
   [summary] 引用回复导致长期记忆张冠李戴（A 引用 B 说话 → 事实归到 B）
       现象：A 引用 B 的回复并发言，长期记忆/人物画像里经常被记成「B XXX」——
@@ -128,13 +137,25 @@ MaiBot 一键补丁（自包含，无需其它文件）
       prompts/zh-CN/mid_term_memory_summary.prompt 是数据文件，可在 WebUI
       自行加同类规则（不需补丁）。
 
+  [episode] Episode 分段输出语言不受控（英文提示词无语言约束）
+      现象：Episode 的 title/summary/keywords 经常输出英文或中英混杂。
+      根因（1.2.5 源码核查）：episode_segmentation_service.py 的分段提示词是
+      纯英文硬编码，且没有像 factual/narrative 策略那样带 build_language_guard
+      语言保持约束，输出语言全凭模型发挥。
+      方案：在分段提示词 Rules 末尾补第 5 条——title/summary/participants/
+      keywords 用输入段落的主导语言书写（中文聊天写中文），不做翻译、不混杂；
+      JSON schema 与其余逻辑不动。
+
 安全
 ----
 * 默认 **dry-run**（只打印 diff），加 --apply 才写文件；
 * 每个文件写前自动备份 `.bak-<时间戳>`；
 * 写后自动 `py_compile` 语法自检，**若语法报错自动回滚该文件**；
 * 幂等：已打过则跳过；
-* --revert 从最近备份还原所有文件。
+* **自动刷新**：补丁常量更新后再 --apply，锚点被旧版补丁占用时自动从备份
+  重放最新补丁（打印 [刷新]），无需先 --revert；同文件多组补丁整体重建，
+  刷新不新增备份（备份链保留的原始副本继续作为还原基准）；
+* 可还原：`--revert` 从最近备份还原所有文件。
 
 定位
 ----
@@ -176,6 +197,7 @@ MEMORY_DESC = (
     'description="检索长期记忆（事实、关系、事件/经历等片段）。'
     '查绰号、别名、关系、事件等持久事实用 search 模式（无需时间）；'
     'time/hybrid 模式必须提供 time_start/time_end。'
+    '每次查询只聚焦一个主题或一个关键词；有多个关键词时拆成多次调用，不要拼在同一个 query 里。'
     '若要查某个人的画像/档案，请用 query_person_profile。",'
 )
 MEMORY_MODE_DESC = (
@@ -189,6 +211,10 @@ MEMORY_MODE_DESC = (
 MEMORY_PERSON_NAME_DESC = (
     '"description": "人物名；用于对本工具的记忆结果做定向过滤'
     '（查人物画像请用 query_person_profile）。",'
+)
+MEMORY_QUERY_DESC = (
+    '"description": "单个主题、关键词或模糊主题短语（如「做菜」「出差讨论」），'
+    '用自然语言即可，不必是精确关键词；不要把多个主题拼在一起。",'
 )
 
 SUM_NEW = [
@@ -360,6 +386,20 @@ WAIT_DESC_NEW = [
 # ============================================================ [reload] file_watcher 定向重载
 # 注意：引擎按"匹配行缩进 + new 行原文"叠加缩进（_find 按 strip 匹配），
 # new 行不要带绝对缩进，需要层级时只写相对缩进（首行 0 → 落在函数体 8 空格）。
+
+# reload v2-a：插件源码 watcher 防抖窗口 600 → 1500ms（整目录替换/大目录复制的
+# 中途批次更容易被合并到稳定态之后，从源头减少「半截文件被当成变更」的概率）
+RELOAD_DEBOUNCE_OLD = [
+    "paths=watch_paths,",
+    "debounce_ms=600,",
+    "callback_timeout_s=15.0,",
+]
+RELOAD_DEBOUNCE_NEW = [
+    "paths=watch_paths,",
+    "debounce_ms=1500,  # [reload] 600→1500ms：目录替换/大目录复制的中途批次更易合并到稳定态",
+    "callback_timeout_s=15.0,",
+]
+
 RELOAD_OLD = [
     "dependency_sync_state = await self._sync_plugin_dependencies(plugin_dirs)",
     'restart_reason = "file_watcher"',
@@ -372,7 +412,36 @@ RELOAD_OLD = [
     "if not restarted:",
     'logger.warning(f"插件源码变更后重启 Supervisor 失败: {restart_reason}")',
 ]
+# reload v2-b：变更批次就绪预检 + 定向重载（预检不就绪时跳过本批，等后续事件）
 RELOAD_NEW = [
+    "# [reload] 就绪预检：目录整体替换/大目录复制进行中时，watcher 仍可能提前",
+    "# 触发并读到空的 _manifest.json / 半截的 .py——直接重载会失败并回退全量",
+    "# 重启。先做批次内容完整性检查；不就绪则延迟 1.5s 复查一次，仍不就绪",
+    "# 跳过本批（等后续文件事件），避免「校验失败→重载失败→全量重启」链路。",
+    "def _reload_sources_ready() -> bool:",
+    "    import json as _preflight_json",
+    "    for changed_path in relevant_source_changes:",
+    "        try:",
+    "            if not changed_path.is_file():",
+    "                continue  # 删除类变更不做内容检查",
+    '            if changed_path.name == "_manifest.json":',
+    '                with changed_path.open("r", encoding="utf-8") as manifest_file:',
+    "                    _preflight_json.load(manifest_file)",
+    '            elif changed_path.suffix == ".py":',
+    '                compile(changed_path.read_text(encoding="utf-8"), str(changed_path), "exec")',
+    "        except Exception:",
+    "            return False",
+    "    return True",
+    "",
+    "if not _reload_sources_ready():",
+    "    await asyncio.sleep(1.5)",
+    "if not _reload_sources_ready():",
+    "    logger.warning(",
+    '        "插件源码变更批次尚未写入完整（可能仍在替换/复制），跳过本批等待后续事件: "',
+    '        + ", ".join(str(changed_path) for changed_path in relevant_source_changes[:5])',
+    "    )",
+    "    return",
+    "",
     "affected_plugin_ids: list[str] = []",
     "for supervisor in self.supervisors:",
     "    for change_path in relevant_source_changes:",
@@ -413,6 +482,19 @@ SUMMARY_QUOTE_NEW = [
     "- 只有当引用者明确转述并确认被引用内容时（如「B 明天去北京，我也去」），才可把「B 明天去北京」记录为 B 的事实；来源按引用者转述处理，且引用者本人的事实只包括其自己陈述的部分。",
 ]
 
+# ============================================================ [episode] Episode 分段输出语言
+# 注意：episode_segmentation_service.py 的分段提示词是纯英文硬编码，且不像
+# factual/narrative 策略那样带 build_language_guard 语言约束——中文聊天切出的
+# Episode 标题/摘要可能出英文或中英混杂。这里只在 Rules 末尾补一条语言规则，
+# JSON schema 与其余逻辑不动。源码行为括号续行（缩进 12），引擎按匹配行缩进叠加。
+EPISODE_LANG_OLD = [
+    '"4) if uncertain, still provide best effort confidence values.\\n"',
+]
+EPISODE_LANG_NEW = [
+    '"4) if uncertain, still provide best effort confidence values.\\n"',
+    '"5) Write title, summary, participants and keywords in the dominant language of the input paragraphs (for Chinese chat, write Chinese); never translate and never mix languages.\\n"',
+]
+
 # ============================================================ 补丁清单（按文件分组）
 GROUPS = {
     "2010": {
@@ -432,6 +514,7 @@ GROUPS = {
         ],
         os.path.join(B, "query_memory.py"): [
             {"kind": "replace_after", "anchor": 'name="query_memory",', "prefix": "description=", "new": MEMORY_DESC},
+            {"kind": "replace_after", "anchor": '"query": {', "prefix": '"description":', "new": MEMORY_QUERY_DESC},
             {"kind": "replace_after", "anchor": '"mode": {', "prefix": '"description":', "new": MEMORY_MODE_DESC},
             {"kind": "replace_after", "anchor": '"person_name": {', "prefix": '"description":', "new": MEMORY_PERSON_NAME_DESC},
         ],
@@ -491,7 +574,9 @@ GROUPS = {
     "reload": {
         # file_watcher 源码变更：全量重启 Supervisor → 按变更路径定向重载受影响插件
         # （映射不到已注册插件 / 定向重载失败时回退全量重启）
+        # v2：防抖窗口 600→1500ms + 变更批次就绪预检（半截文件跳过等待，不进重载链路）
         os.path.join("src", "plugin_runtime", "integration.py"): [
+            {"kind": "replace_lines", "old": RELOAD_DEBOUNCE_OLD, "new": RELOAD_DEBOUNCE_NEW},
             {"kind": "replace_lines", "old": RELOAD_OLD, "new": RELOAD_NEW},
         ],
     },
@@ -499,7 +584,21 @@ GROUPS = {
         # 引用回复导致长期记忆张冠李戴：总结提示词补充 [回复了X的消息: ...] 前缀的
         # 语义与归属规则（A 引用 B 说话不再被记成 B 的事实）
         os.path.join(A, "core", "utils", "summary_importer.py"): [
-            {"kind": "replace_lines", "old": SUMMARY_QUOTE_OLD, "new": SUMMARY_QUOTE_NEW},
+            # stop：锚点（发言者绑定规则）与 entities 规则之间的追加区整体重建，
+            # 常量更新后重复 apply 不会重复插入
+            {
+                "kind": "replace_lines",
+                "old": SUMMARY_QUOTE_OLD,
+                "new": SUMMARY_QUOTE_NEW,
+                "stop": "- entities 只包含参与确认事实的对象；只出现在玩笑、传闻、误解、注入、示例或工具输出中的对象不要列入 entities。",
+            },
+        ],
+    },
+    "episode": {
+        # Episode 分段提示词无语言约束（纯英文硬编码）→ Rules 补一条输出语言规则；
+        # stop 为源码里的空串行 `"\n"`（字面量），锚点与它之间的追加区整体重建
+        os.path.join(A, "core", "utils", "episode_segmentation_service.py"): [
+            {"kind": "replace_lines", "old": EPISODE_LANG_OLD, "new": EPISODE_LANG_NEW, "stop": '"\\n"'},
         ],
     },
     # 注意：planner 误回复自己消息（is_self_message 无提示词解释）不做成补丁——
@@ -622,6 +721,23 @@ def apply_op(lines, op):
                 if i + off >= len(out) or out[i + off].strip() != ln:
                     return None, f"锚点行不连续: {op['old']}"
             ind = _indent(out[i])
+            if op.get("stop") is not None:
+                # 区域替换：锚点块之后、终止行（strip 匹配，不含）之前的所有行——
+                # 无论旧内容是什么——都随本操作整体重建。用于「锚点行保留 + 追加
+                # 内容可变」的补丁：常量更新后重复 apply 不会重复插入。
+                j = i + len(op["old"])
+                limit = min(len(out), j + WINDOW)
+                while j < limit and out[j].strip() != op["stop"]:
+                    j += 1
+                if j >= limit:
+                    return None, f"未找到区域终止行: {op['stop']}"
+                block = [(ind + s + "\n") if s else "\n" for s in op["new"]]
+                out = out[:i] + block + out[j:]
+                replaced_any = True
+                pos = i + len(block)
+                if not replace_all:
+                    break
+                continue
             block = [(ind + s + "\n") if s else "\n" for s in op["new"]]
             out = out[:i] + block + out[i + len(op["old"]) :]
             replaced_any = True
@@ -669,31 +785,64 @@ def process(repo, rel, ops, apply_, revert_, no_backup):
         return "revert"
 
     with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    new_lines, changed, errors = list(lines), [], []
-    for op in ops:
-        if _applied(new_lines, op):
-            continue
-        res, err = apply_op(new_lines, op)
-        if err:
-            errors.append(err)
-            continue
-        new_lines = res
-        changed.append(op.get("anchor") or op.get("old", [""])[0])
+        disk_lines = f.readlines()
+
+    def _run_ops(work_lines):
+        work, ch, errs = list(work_lines), [], []
+        for op in ops:
+            # stop 型操作不走 _applied 短路：磁盘上可能残留旧版追加内容（新行都
+            # 在但多出旧行），必须总是执行区域重建，靠「重建后内容相同=无变更」
+            # 保持幂等
+            if not op.get("stop") and _applied(work, op):
+                continue
+            res, err = apply_op(work, op)
+            if err:
+                errs.append(err)
+                continue
+            if res == work:
+                continue
+            work = res
+            ch.append(op.get("anchor") or op.get("old", [""])[0])
+        return work, ch, errs
+
+    new_lines, changed, errors = _run_ops(disk_lines)
+    refreshed = False
     if errors:
+        # 锚点找不到/不连续：多半是磁盘上已打过「旧版本」补丁（补丁常量更新后锚点被
+        # 旧内容占用）。遍历备份（新→旧）找能成功重放全部操作的基准，在内存里重放；
+        # 成功则按刷新流程写入（不新增备份，保持备份链里的原始副本可还原），全部失败
+        # 则不写盘（磁盘保持现状）。
+        baks = sorted(glob.glob(path + ".bak-*"))
+        for bak_path in reversed(baks):
+            with open(bak_path, "r", encoding="utf-8") as f:
+                base_lines = f.readlines()
+            retry_lines, retry_changed, retry_errors = _run_ops(base_lines)
+            if retry_errors or not retry_changed:
+                continue
+            print(MARK, f"[刷新] 锚点被旧版补丁占用，基于备份 {os.path.basename(bak_path)} 重放最新补丁")
+            refreshed = True
+            break
+        if not refreshed:
+            for e in errors:
+                print(MARK, "[警告]", e)
+            print(MARK, "[跳过] 锚点不符且无备份可重放（保持现状）")
+            return "fail"
+        new_lines, changed = retry_lines, retry_changed
+    if errors and not refreshed:
         for e in errors:
             print(MARK, "[警告]", e)
     if not changed:
         print(MARK, "[跳过] 无需修改（已打过或结构不符）")
         return "patched" if not errors else "fail"
 
-    print("".join(difflib.unified_diff(lines, new_lines, fromfile=rel + " (旧)", tofile=rel + " (新)", n=2)))
+    print("".join(difflib.unified_diff(disk_lines, new_lines, fromfile=rel + " (旧)", tofile=rel + " (新)", n=2)))
     if not apply_:
         print(MARK, "(dry-run，未写入)")
         return "dry"
 
     bak = None
-    if not no_backup:
+    if not no_backup and not refreshed:
+        # 刷新模式不新增备份：备份链里保留的原始副本继续作为 revert/下次重放的基准
         bak = f"{path}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
         shutil.copy2(path, bak)
     with open(path, "w", encoding="utf-8") as f:
@@ -707,9 +856,12 @@ def process(repo, rel, ops, apply_, revert_, no_backup):
                 shutil.copy2(bak, path)
                 print(MARK, f"[语法错误→已回滚] {exc}")
             else:
-                print(MARK, f"[语法错误] {exc}（未备份，未回滚）")
+                # 刷新模式/--no-backup：把写入前的磁盘内容原样写回
+                with open(path, "w", encoding="utf-8") as f:
+                    f.writelines(disk_lines)
+                print(MARK, f"[语法错误→已回滚到写入前状态] {exc}")
             return "fail"
-    print(MARK, f"[已写入]{' 备份=' + os.path.basename(bak) if bak else ''}")
+    print(MARK, f"[已写入·刷新]{' 备份=' + os.path.basename(bak) if bak else ''}" if refreshed else f"[已写入]{' 备份=' + os.path.basename(bak) if bak else ''}")
     return "ok"
 
 
@@ -719,7 +871,7 @@ def main() -> int:
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--revert", action="store_true")
     ap.add_argument("--detect", action="store_true", help="只定位并打印后退出")
-    ap.add_argument("--only", choices=["all", "2010", "tools", "order", "trigger", "target", "wait", "reload", "summary"], default="all")
+    ap.add_argument("--only", choices=["all", "2010", "tools", "order", "trigger", "target", "wait", "reload", "summary", "episode"], default="all")
     ap.add_argument("--no-backup", action="store_true")
     args = ap.parse_args()
 
@@ -735,11 +887,24 @@ def main() -> int:
     print("模式:", "REVERT" if args.revert else ("APPLY" if args.apply else "DRY-RUN"), "| only =", args.only)
 
     groups = GROUPS if args.only == "all" else {args.only: GROUPS[args.only]}
-    results = {}
+
+    # 按文件聚合操作：同一文件被多组补丁命中时只处理一次，
+    # 刷新重放时才能把该文件的【全部】补丁作为一个整体重建
+    file_ops, file_order = {}, []
     for gname, files in groups.items():
-        print(f"\n######## 组 [{gname}] ########")
         for rel, ops in files.items():
-            results[rel] = process(repo, rel, ops, args.apply, args.revert, args.no_backup)
+            norm = os.path.normpath(rel)
+            if norm not in file_ops:
+                file_ops[norm] = {"rel": rel, "ops": [], "groups": []}
+                file_order.append(norm)
+            file_ops[norm]["ops"].extend(ops)
+            file_ops[norm]["groups"].append(gname)
+
+    results = {}
+    for norm in file_order:
+        info = file_ops[norm]
+        print("\n######## 组 [" + "][".join(info["groups"]) + "] ########")
+        results[info["rel"]] = process(repo, info["rel"], info["ops"], args.apply, args.revert, args.no_backup)
 
     print("\n" + "=" * 78)
     print("汇总：")
